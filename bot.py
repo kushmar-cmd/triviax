@@ -1,6 +1,6 @@
 """
-🎯 בוט טריוויה ישראלי — גרסה 3
-10 קטגוריות | סולו + קבוצתי | Claude AI
+🎯 בוט טריוויה ישראלי — גרסה 4
+10 קטגוריות | סולו + קבוצתי | היסטוריה נשמרת | Claude AI
 """
 
 import os
@@ -9,13 +9,14 @@ import random
 import asyncio
 import logging
 from anthropic import AsyncAnthropic
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
 )
+from telegram.error import BadRequest
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -81,28 +82,28 @@ def cat_label(key: str) -> str:
 
 
 def resolve_cat(cat: str) -> str:
-    """אם מעורב — בחר קטגוריה אקראית"""
     if cat == "mixed":
-        real_cats = [k for k in CATEGORIES if k != "mixed"]
-        return random.choice(real_cats)
+        return random.choice([k for k in CATEGORIES if k != "mixed"])
     return cat
 
 
 def build_main_menu(name: str, is_group: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    text = f"🎯 ברוך הבא {name}!"
     if is_group:
         text = f"🎯 שלום {name}! בוט טריוויה ישראלי"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("👥 שאלה קבוצתית", callback_data="menu:trivia")],
             [InlineKeyboardButton("📊 הניקוד שלי", callback_data="menu:score"),
              InlineKeyboardButton("🏆 טבלה", callback_data="menu:top")],
+            [InlineKeyboardButton("🗑 נקה היסטוריה", callback_data="menu:clear")],
         ])
     else:
-        text = f"🎯 ברוך הבא {name}!"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎮 משחק סולו", callback_data="menu:play")],
             [InlineKeyboardButton("👥 שאלה קבוצתית", callback_data="menu:trivia")],
             [InlineKeyboardButton("📊 הניקוד שלי", callback_data="menu:score"),
              InlineKeyboardButton("🏆 טבלה", callback_data="menu:top")],
+            [InlineKeyboardButton("🗑 נקה היסטוריה", callback_data="menu:clear")],
         ])
     return text, keyboard
 
@@ -136,22 +137,53 @@ def build_answer_keyboard(options: list, cat: str, diff: str, prefix: str = "ans
     ]
     return InlineKeyboardMarkup(rows)
 
+
+def build_next_keyboard(cat: str, diff: str) -> InlineKeyboardMarkup:
+    """כפתורים אחרי תשובה — השאלה נשארת, הכפתורים נעולים"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ שאלה הבאה", callback_data=f"diff:{cat}:{diff}")],
+        [InlineKeyboardButton("🗂 קטגוריה אחרת", callback_data="menu:play"),
+         InlineKeyboardButton("🗑 נקה היסטוריה", callback_data="menu:clear")],
+    ])
+
+# ══════════════════════════════════════════════════════════
+#  ניהול היסטוריית הודעות
+# ══════════════════════════════════════════════════════════
+
+def track_message(user_data: dict, msg: Message):
+    """שמור message_id להיסטוריה"""
+    history = user_data.setdefault("msg_history", [])
+    history.append(msg.message_id)
+
+
+async def clear_history(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_data: dict):
+    """מחק את כל הודעות המשחק"""
+    history = user_data.get("msg_history", [])
+    deleted = 0
+    for mid in history:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except BadRequest:
+            pass  # הודעה כבר נמחקה או ישנה מדי
+    user_data["msg_history"]      = []
+    user_data["asked_questions"]  = []
+    user_data.pop("solo_q", None)
+    user_data.pop("solo_cat", None)
+    user_data.pop("solo_diff", None)
+    return deleted
+
 # ══════════════════════════════════════════════════════════
 #  יצירת שאלה עם Claude
 # ══════════════════════════════════════════════════════════
 
 async def generate_question(cat: str, difficulty: str, asked: list = None) -> dict:
-    """
-    cat: קטגוריה אמיתית (לא mixed)
-    asked: רשימת שאלות שכבר נשאלו (למניעת חזרות)
-    """
     diff_map  = {"easy": "קלה", "medium": "בינונית", "hard": "קשה"}
     topic     = CATEGORY_PROMPTS.get(cat, "ידע כללי")
     diff_he   = diff_map.get(difficulty, "בינונית")
     avoid_str = ""
     if asked:
-        last = asked[-5:]  # מספיק 5 אחרונות
-        avoid_str = f"\nאל תחזור על השאלות האלה: {'; '.join(last)}"
+        avoid_str = f"\nאל תחזור על השאלות האלה: {'; '.join(asked[-5:])}"
 
     prompt = (
         f"צור שאלת טריוויה על הנושא: {topic}. רמת קושי: {diff_he}.\n"
@@ -179,8 +211,7 @@ async def generate_question(cat: str, difficulty: str, asked: list = None) -> di
 # ══════════════════════════════════════════════════════════
 
 def get_user_score(bot_data: dict, uid: str) -> dict:
-    scores = bot_data.setdefault("scores", {})
-    return scores.setdefault(uid, {"score": 0, "total": 0, "name": "שחקן"})
+    return bot_data.setdefault("scores", {}).setdefault(uid, {"score": 0, "total": 0, "name": "שחקן"})
 
 
 def update_score(bot_data: dict, uid: str, name: str, correct: bool):
@@ -213,15 +244,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name     = update.effective_user.first_name or "חבר"
     is_group = update.effective_chat.type in ("group", "supergroup")
     text, keyboard = build_main_menu(name, is_group)
-    await update.message.reply_text(text, reply_markup=keyboard)
+    msg = await update.message.reply_text(text, reply_markup=keyboard)
+    track_message(ctx.user_data, msg)
 
 
 async def cmd_play(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "🎮 *משחק סולו — בחר קטגוריה:*",
         parse_mode="Markdown",
         reply_markup=build_category_keyboard("cat"),
     )
+    track_message(ctx.user_data, msg)
 
 
 async def cmd_trivia(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -229,11 +262,12 @@ async def cmd_trivia(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if get_group_game(ctx.bot_data, chat_id):
         await update.message.reply_text("⏳ כבר יש שאלה פעילה! ענו עליה קודם.")
         return
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "👥 *משחק קבוצתי — בחר קטגוריה:*",
         parse_mode="Markdown",
         reply_markup=build_category_keyboard("gcat"),
     )
+    track_message(ctx.user_data, msg)
 
 
 async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -241,11 +275,9 @@ async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d    = get_user_score(ctx.bot_data, uid)
     s, t = d["score"], d["total"]
     pct  = int(s / t * 100) if t else 0
-    _, keyboard = build_main_menu(update.effective_user.first_name or "חבר")
     await update.message.reply_text(
         f"{score_emoji(s)} *הניקוד שלך:*\n\n✅ נכון: {s}/{t}\n📊 הצלחה: {pct}%",
         parse_mode="Markdown",
-        reply_markup=keyboard,
     )
 
 
@@ -261,48 +293,57 @@ async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{medals[i]} {d.get('name','???')}: {d['score']} ({d['total']} שאלות)")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
+async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    deleted = await clear_history(ctx, chat_id, ctx.user_data)
+    name    = update.effective_user.first_name or "חבר"
+    is_group = update.effective_chat.type in ("group", "supergroup")
+    text, keyboard = build_main_menu(name, is_group)
+    msg = await update.message.reply_text(
+        f"🗑 נמחקו {deleted} הודעות. מתחילים מחדש!\n\n{text}",
+        reply_markup=keyboard,
+    )
+    track_message(ctx.user_data, msg)
+
 # ══════════════════════════════════════════════════════════
-#  שליחת שאלה חדשה (סולו) — פונקציה משותפת
+#  שליחת שאלה חדשה (סולו) — שולח הודעה חדשה
 # ══════════════════════════════════════════════════════════
 
 async def send_solo_question(query, ctx: ContextTypes.DEFAULT_TYPE, cat: str, diff: str):
     real_cat = resolve_cat(cat)
     asked    = ctx.user_data.get("asked_questions", [])
+    chat_id  = query.message.chat_id
 
-    await query.edit_message_text(f"⏳ יוצר שאלה ב{cat_label(real_cat)}...")
+    # הודעת טעינה חדשה
+    loading_msg = await ctx.bot.send_message(chat_id, f"⏳ יוצר שאלה ב{cat_label(real_cat)}...")
+    track_message(ctx.user_data, loading_msg)
 
     try:
         q = await generate_question(real_cat, diff, asked)
     except Exception as e:
         logger.error(f"generate_question error: {e}")
-        await query.edit_message_text(
-            "❌ שגיאה ביצירת שאלה.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 נסה שוב", callback_data=f"diff:{cat}:{diff}"),
-                InlineKeyboardButton("🏠 תפריט", callback_data="menu:home"),
-            ]])
-        )
+        await loading_msg.edit_text("❌ שגיאה ביצירת שאלה. נסה שוב.")
         return
 
-    # שמור שאלה + היסטוריה
+    # עדכן היסטוריה
     asked.append(q["question"])
     if len(asked) > 20:
         asked = asked[-20:]
     ctx.user_data["asked_questions"] = asked
-    ctx.user_data["solo_q"]    = q
-    ctx.user_data["solo_cat"]  = cat       # המקורי (יכול להיות mixed)
-    ctx.user_data["solo_diff"] = diff
-    ctx.user_data["solo_real_cat"] = real_cat
+    ctx.user_data["solo_q"]          = q
+    ctx.user_data["solo_cat"]        = cat
+    ctx.user_data["solo_diff"]       = diff
 
     diff_label = DIFFICULTIES.get(diff, diff)
-    await query.edit_message_text(
+    await loading_msg.edit_text(
         f"🎮 *{cat_label(real_cat)} | {diff_label}*\n\n{q['question']}",
         parse_mode="Markdown",
         reply_markup=build_answer_keyboard(q["options"], cat, diff, "ans"),
     )
 
 # ══════════════════════════════════════════════════════════
-#  Callback router ראשי
+#  Callback router
 # ══════════════════════════════════════════════════════════
 
 async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -316,68 +357,82 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_group_answer(update, ctx)
         return
 
-    # ── תפריט ראשי ──────────────────────────────────────
+    # ── תפריט ──────────────────────────────────────────
     if data.startswith("menu:"):
-        action = data.split(":")[1]
-        name   = query.from_user.first_name or "חבר"
+        action   = data.split(":")[1]
+        name     = query.from_user.first_name or "חבר"
         is_group = update.effective_chat.type in ("group", "supergroup")
 
         if action == "home":
             text, keyboard = build_main_menu(name, is_group)
-            await query.edit_message_text(text, reply_markup=keyboard)
+            msg = await ctx.bot.send_message(chat_id, text, reply_markup=keyboard)
+            track_message(ctx.user_data, msg)
 
         elif action == "play":
-            await query.edit_message_text(
+            msg = await ctx.bot.send_message(
+                chat_id,
                 "🎮 *משחק סולו — בחר קטגוריה:*",
                 parse_mode="Markdown",
                 reply_markup=build_category_keyboard("cat"),
             )
+            track_message(ctx.user_data, msg)
 
         elif action == "trivia":
             if get_group_game(ctx.bot_data, chat_id):
-                await query.edit_message_text("⏳ כבר יש שאלה פעילה! ענו עליה קודם.")
+                await ctx.bot.send_message(chat_id, "⏳ כבר יש שאלה פעילה!")
                 return
-            await query.edit_message_text(
+            msg = await ctx.bot.send_message(
+                chat_id,
                 "👥 *משחק קבוצתי — בחר קטגוריה:*",
                 parse_mode="Markdown",
                 reply_markup=build_category_keyboard("gcat"),
             )
+            track_message(ctx.user_data, msg)
 
         elif action == "score":
             uid  = str(query.from_user.id)
             d    = get_user_score(ctx.bot_data, uid)
             s, t = d["score"], d["total"]
             pct  = int(s / t * 100) if t else 0
-            text, keyboard = build_main_menu(name, is_group)
-            await query.edit_message_text(
+            await ctx.bot.send_message(
+                chat_id,
                 f"{score_emoji(s)} *הניקוד שלך:*\n\n✅ נכון: {s}/{t}\n📊 הצלחה: {pct}%",
                 parse_mode="Markdown",
-                reply_markup=keyboard,
             )
 
         elif action == "top":
             scores = ctx.bot_data.get("scores", {})
             if not scores:
-                text, keyboard = build_main_menu(name, is_group)
-                await query.edit_message_text("אין ניקודים עדיין!", reply_markup=keyboard)
+                await ctx.bot.send_message(chat_id, "אין ניקודים עדיין!")
                 return
             top    = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)[:5]
             medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
             lines  = ["🏆 *טבלת מובילים:*\n"]
             for i, (uid, d) in enumerate(top):
                 lines.append(f"{medals[i]} {d.get('name','???')}: {d['score']} ({d['total']} שאלות)")
+            await ctx.bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+
+        elif action == "clear":
+            deleted = await clear_history(ctx, chat_id, ctx.user_data)
             text, keyboard = build_main_menu(name, is_group)
-            await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
+            msg = await ctx.bot.send_message(
+                chat_id,
+                f"🗑 נמחקו {deleted} הודעות. מתחילים מחדש!\n\n{text}",
+                reply_markup=keyboard,
+            )
+            track_message(ctx.user_data, msg)
 
     # ── סולו: בחירת קטגוריה ────────────────────────────
     elif data.startswith("cat:"):
         cat = data.split(":")[1]
         ctx.user_data["solo_cat"] = cat
-        await query.edit_message_text(
+        msg = await ctx.bot.send_message(
+            chat_id,
             f"🎮 *{cat_label(cat)}*\nבחר רמת קושי:",
             parse_mode="Markdown",
             reply_markup=build_difficulty_keyboard(cat, "diff"),
         )
+        track_message(ctx.user_data, msg)
 
     # ── סולו: בחירת קושי → שאלה ────────────────────────
     elif data.startswith("diff:"):
@@ -387,15 +442,14 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── סולו: תשובה ────────────────────────────────────
     elif data.startswith("ans:"):
-        parts    = data.split(":")
+        parts              = data.split(":")
         cat, diff, chosen_str = parts[1], parts[2], parts[3]
-        chosen   = int(chosen_str)
-        q        = ctx.user_data.get("solo_q")
+        chosen             = int(chosen_str)
+        q                  = ctx.user_data.get("solo_q")
 
         if not q:
-            name = query.from_user.first_name or "חבר"
-            text, keyboard = build_main_menu(name)
-            await query.edit_message_text("המשחק פג. בחר מחדש:", reply_markup=keyboard)
+            text, keyboard = build_main_menu(query.from_user.first_name or "חבר")
+            await ctx.bot.send_message(chat_id, "המשחק פג. בחר מחדש:", reply_markup=keyboard)
             return
 
         correct      = q["correct"]
@@ -410,64 +464,70 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         result = "✅ *נכון!*" if is_correct else "❌ *לא נכון*"
 
-        # ← ממשיך אוטומטית לשאלה הבאה
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ שאלה הבאה", callback_data=f"diff:{cat}:{diff}")],
-            [InlineKeyboardButton("🗂 קטגוריה אחרת", callback_data="menu:play"),
-             InlineKeyboardButton("🏠 תפריט", callback_data="menu:home")],
-        ])
+        # נעל את כפתורי השאלה (הסר אותם)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
 
-        await query.edit_message_text(
+        # שלח תוצאה כהודעה חדשה
+        msg = await ctx.bot.send_message(
+            chat_id,
             f"{result}\n\n"
             f"✅ תשובה: *{correct_text}*\n"
             f"💡 {q.get('explanation','')}\n\n"
             f"📊 ניקוד: {d['score']}/{d['total']}",
             parse_mode="Markdown",
-            reply_markup=keyboard,
+            reply_markup=build_next_keyboard(cat, diff),
         )
+        track_message(ctx.user_data, msg)
 
     # ── חזרה לקטגוריות ──────────────────────────────────
     elif data.startswith("back_cats:"):
-        prefix = data.split(":")[1]
+        prefix     = data.split(":")[1]
         cat_prefix = "cat" if prefix == "diff" else "gcat"
-        await query.edit_message_text(
+        msg = await ctx.bot.send_message(
+            chat_id,
             "🎮 *בחר קטגוריה:*",
             parse_mode="Markdown",
             reply_markup=build_category_keyboard(cat_prefix),
         )
+        track_message(ctx.user_data, msg)
 
     # ── קבוצתי: בחירת קטגוריה ──────────────────────────
     elif data.startswith("gcat:"):
         cat = data.split(":")[1]
-        await query.edit_message_text(
+        msg = await ctx.bot.send_message(
+            chat_id,
             f"👥 *{cat_label(cat)}*\nבחר רמת קושי:",
             parse_mode="Markdown",
             reply_markup=build_difficulty_keyboard(cat, "gdiff"),
         )
+        track_message(ctx.user_data, msg)
 
     # ── קבוצתי: בחירת קושי → שאלה ─────────────────────
     elif data.startswith("gdiff:"):
-        parts = data.split(":")
+        parts           = data.split(":")
         cat, difficulty = parts[1], parts[2]
-        chat_id = update.effective_chat.id
 
         if get_group_game(ctx.bot_data, chat_id):
             return
 
-        real_cat = resolve_cat(cat)
-        await query.edit_message_text(f"⏳ יוצר שאלה קבוצתית ב{cat_label(real_cat)}...")
+        real_cat    = resolve_cat(cat)
+        loading_msg = await ctx.bot.send_message(chat_id, f"⏳ יוצר שאלה קבוצתית ב{cat_label(real_cat)}...")
+        track_message(ctx.user_data, loading_msg)
 
         try:
             q = await generate_question(real_cat, difficulty)
         except Exception as e:
             logger.error(f"group generate_question error: {e}")
-            await query.edit_message_text("❌ שגיאה. נסה שוב עם /trivia")
+            await loading_msg.edit_text("❌ שגיאה. נסה שוב עם /trivia")
             return
 
         game = {"q": q, "cat": cat, "real_cat": real_cat, "difficulty": difficulty, "answered": False}
         set_group_game(ctx.bot_data, chat_id, game)
 
-        await query.edit_message_text(
+        await loading_msg.edit_text(
             f"👥 *{cat_label(real_cat)} | {DIFFICULTIES[difficulty]}*\n"
             f"⏱ {GROUP_TIMEOUT} שניות לענות!\n\n"
             f"{q['question']}",
@@ -505,12 +565,12 @@ async def handle_group_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not game or game.get("answered"):
         return
 
-    parts      = data.split(":")
+    parts              = data.split(":")
     cat, diff, chosen_str = parts[1], parts[2], parts[3]
-    chosen     = int(chosen_str)
-    q          = game["q"]
-    correct    = q["correct"]
-    is_correct = (chosen == correct)
+    chosen             = int(chosen_str)
+    q                  = game["q"]
+    correct            = q["correct"]
+    is_correct         = (chosen == correct)
 
     game["answered"] = True
     set_group_game(ctx.bot_data, chat_id, None)
@@ -521,6 +581,12 @@ async def handle_group_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     update_score(ctx.bot_data, uid, name, is_correct)
     d = get_user_score(ctx.bot_data, uid)
+
+    # נעל כפתורי השאלה
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
 
     if is_correct:
         text = (
@@ -538,7 +604,7 @@ async def handle_group_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"כתבו /trivia לשאלה הבאה!"
         )
 
-    await query.edit_message_text(text, parse_mode="Markdown")
+    await ctx.bot.send_message(chat_id, text, parse_mode="Markdown")
 
 # ══════════════════════════════════════════════════════════
 #  הפעלה
@@ -552,9 +618,10 @@ def main():
     app.add_handler(CommandHandler("trivia", cmd_trivia))
     app.add_handler(CommandHandler("score",  cmd_score))
     app.add_handler(CommandHandler("top",    cmd_top))
+    app.add_handler(CommandHandler("clear",  cmd_clear))
     app.add_handler(CallbackQueryHandler(callback_router))
 
-    logger.info("🎯 בוט טריוויה v3 מתחיל...")
+    logger.info("🎯 בוט טריוויה v4 מתחיל...")
     app.run_polling()
 
 
