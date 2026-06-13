@@ -1,10 +1,11 @@
 """
-🎯 בוט טריוויה ישראלי — גרסה 2
-8 קטגוריות | סולו + קבוצתי | Claude AI
+🎯 בוט טריוויה ישראלי — גרסה 3
+10 קטגוריות | סולו + קבוצתי | Claude AI
 """
 
 import os
 import json
+import random
 import asyncio
 import logging
 from anthropic import AsyncAnthropic
@@ -13,8 +14,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    filters,
     ContextTypes,
 )
 
@@ -24,9 +23,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN        = os.environ["BOT_TOKEN"]
+BOT_TOKEN         = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-anthropic        = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+anthropic         = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+GROUP_TIMEOUT = 20
 
 # ══════════════════════════════════════════════════════════
 #  קטגוריות
@@ -35,12 +36,26 @@ anthropic        = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 CATEGORIES = {
     "sport":    ("⚽", "ספורט וכדורגל"),
     "history":  ("🇮🇱", "היסטוריה ישראלית"),
+    "world":    ("🌐", "היסטוריה עולמית"),
     "music":    ("🎵", "מוזיקה עולמית"),
     "ilmusic":  ("🎶", "מוזיקה ישראלית"),
     "general":  ("🧠", "ידע כללי"),
     "geo":      ("🌍", "גיאוגרפיה"),
     "cinema":   ("🎬", "קולנוע וטלוויזיה"),
     "science":  ("🔬", "מדע וטבע"),
+    "mixed":    ("🎲", "מעורב — הכל"),
+}
+
+CATEGORY_PROMPTS = {
+    "sport":   "ספורט וכדורגל (ישראלי ועולמי)",
+    "history": "היסטוריה ישראלית",
+    "world":   "היסטוריה עולמית (מלחמות, מנהיגים, אירועים)",
+    "music":   "מוזיקה עולמית (להקות, אמנים, אלבומים)",
+    "ilmusic": "מוזיקה ישראלית (זמרים, להקות, שירים)",
+    "general": "ידע כללי מגוון",
+    "geo":     "גיאוגרפיה עולמית ועיר בירה",
+    "cinema":  "קולנוע וטלוויזיה (ישראלי ועולמי)",
+    "science": "מדע וטבע (ביולוגיה, פיזיקה, כימיה, חלל)",
 }
 
 DIFFICULTIES = {
@@ -48,9 +63,6 @@ DIFFICULTIES = {
     "medium": "🟡 בינוני",
     "hard":   "🔴 קשה",
 }
-
-# זמן מענה בשניות במצב קבוצתי
-GROUP_TIMEOUT = 20
 
 # ══════════════════════════════════════════════════════════
 #  עזרים
@@ -68,29 +80,58 @@ def cat_label(key: str) -> str:
     return f"{e} {n}"
 
 
-def build_category_keyboard() -> InlineKeyboardMarkup:
+def resolve_cat(cat: str) -> str:
+    """אם מעורב — בחר קטגוריה אקראית"""
+    if cat == "mixed":
+        real_cats = [k for k in CATEGORIES if k != "mixed"]
+        return random.choice(real_cats)
+    return cat
+
+
+def build_main_menu(name: str, is_group: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    if is_group:
+        text = f"🎯 שלום {name}! בוט טריוויה ישראלי"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 שאלה קבוצתית", callback_data="menu:trivia")],
+            [InlineKeyboardButton("📊 הניקוד שלי", callback_data="menu:score"),
+             InlineKeyboardButton("🏆 טבלה", callback_data="menu:top")],
+        ])
+    else:
+        text = f"🎯 ברוך הבא {name}!"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎮 משחק סולו", callback_data="menu:play")],
+            [InlineKeyboardButton("👥 שאלה קבוצתית", callback_data="menu:trivia")],
+            [InlineKeyboardButton("📊 הניקוד שלי", callback_data="menu:score"),
+             InlineKeyboardButton("🏆 טבלה", callback_data="menu:top")],
+        ])
+    return text, keyboard
+
+
+def build_category_keyboard(prefix: str = "cat") -> InlineKeyboardMarkup:
     keys = list(CATEGORIES.keys())
     rows = []
     for i in range(0, len(keys), 2):
         row = []
         for k in keys[i:i+2]:
             e, n = CATEGORIES[k]
-            row.append(InlineKeyboardButton(f"{e} {n}", callback_data=f"cat:{k}"))
+            row.append(InlineKeyboardButton(f"{e} {n}", callback_data=f"{prefix}:{k}"))
         rows.append(row)
+    rows.append([InlineKeyboardButton("🏠 תפריט ראשי", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_difficulty_keyboard(cat: str) -> InlineKeyboardMarkup:
+def build_difficulty_keyboard(cat: str, prefix: str = "diff") -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(label, callback_data=f"diff:{cat}:{key}")]
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:{cat}:{key}")]
         for key, label in DIFFICULTIES.items()
     ]
+    rows.append([InlineKeyboardButton("↩️ חזרה", callback_data=f"back_cats:{prefix}")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_answer_keyboard(options: list, cat: str) -> InlineKeyboardMarkup:
+def build_answer_keyboard(options: list, cat: str, diff: str, prefix: str = "ans") -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"{i+1}. {opt}", callback_data=f"ans:{cat}:{i}")]
+        [InlineKeyboardButton(f"{i+1}. {opt}", callback_data=f"{prefix}:{cat}:{diff}:{i}")]
         for i, opt in enumerate(options)
     ]
     return InlineKeyboardMarkup(rows)
@@ -99,25 +140,22 @@ def build_answer_keyboard(options: list, cat: str) -> InlineKeyboardMarkup:
 #  יצירת שאלה עם Claude
 # ══════════════════════════════════════════════════════════
 
-CATEGORY_PROMPTS = {
-    "sport":   "ספורט וכדורגל (ישראלי ועולמי)",
-    "history": "היסטוריה ישראלית",
-    "music":   "מוזיקה עולמית (להקות, אמנים, אלבומים)",
-    "ilmusic": "מוזיקה ישראלית (זמרים, להקות, שירים)",
-    "general": "ידע כללי מגוון",
-    "geo":     "גיאוגרפיה עולמית ועיר בירה",
-    "cinema":  "קולנוע וטלוויזיה (ישראלי ועולמי)",
-    "science": "מדע וטבע (ביולוגיה, פיזיקה, כימיה, חלל)",
-}
-
-async def generate_question(cat: str, difficulty: str) -> dict:
-    diff_map = {"easy": "קלה", "medium": "בינונית", "hard": "קשה"}
-    topic = CATEGORY_PROMPTS.get(cat, "ידע כללי")
-    diff_he = diff_map.get(difficulty, "בינונית")
+async def generate_question(cat: str, difficulty: str, asked: list = None) -> dict:
+    """
+    cat: קטגוריה אמיתית (לא mixed)
+    asked: רשימת שאלות שכבר נשאלו (למניעת חזרות)
+    """
+    diff_map  = {"easy": "קלה", "medium": "בינונית", "hard": "קשה"}
+    topic     = CATEGORY_PROMPTS.get(cat, "ידע כללי")
+    diff_he   = diff_map.get(difficulty, "בינונית")
+    avoid_str = ""
+    if asked:
+        last = asked[-5:]  # מספיק 5 אחרונות
+        avoid_str = f"\nאל תחזור על השאלות האלה: {'; '.join(last)}"
 
     prompt = (
         f"צור שאלת טריוויה על הנושא: {topic}. רמת קושי: {diff_he}.\n"
-        "השאלה חייבת להיות בעברית.\n"
+        f"השאלה חייבת להיות בעברית. היא חייבת להיות שונה לחלוטין מכל שאלה קודמת.{avoid_str}\n"
         "החזר JSON בלבד — ללא backticks, ללא טקסט לפני/אחרי.\n"
         "מבנה מדויק:\n"
         '{"question":"...","options":["...","...","...","..."],"correct":0,"explanation":"..."}\n'
@@ -172,78 +210,29 @@ def set_group_game(bot_data: dict, chat_id: int, game: dict | None):
 # ══════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    name = update.effective_user.first_name or "חבר"
+    name     = update.effective_user.first_name or "חבר"
     is_group = update.effective_chat.type in ("group", "supergroup")
-
-    if is_group:
-        text = (
-            f"👋 שלום {name}! אני בוט הטריוויה הישראלי.\n\n"
-            "📋 פקודות:\n"
-            "/trivia — שאלה קבוצתית (כולם יכולים לענות!)\n"
-            "/score — הניקוד שלך\n"
-            "/top — טבלת מובילים\n"
-            "/help — עזרה"
-        )
-    else:
-        text = (
-            f"🎯 ברוך הבא {name}!\n\n"
-            "📋 פקודות:\n"
-            "/play — משחק סולו\n"
-            "/trivia — שאלה קבוצתית\n"
-            "/score — הניקוד שלך\n"
-            "/top — טבלת מובילים\n"
-            "/help — עזרה"
-        )
-    await update.message.reply_text(text)
-
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "*🎯 בוט טריוויה ישראלי*\n\n"
-        "8 קטגוריות:\n"
-        "⚽ ספורט וכדורגל\n"
-        "🇮🇱 היסטוריה ישראלית\n"
-        "🎵 מוזיקה עולמית\n"
-        "🎶 מוזיקה ישראלית\n"
-        "🧠 ידע כללי\n"
-        "🌍 גיאוגרפיה\n"
-        "🎬 קולנוע וטלוויזיה\n"
-        "🔬 מדע וטבע\n\n"
-        "*מצבי משחק:*\n"
-        "🎮 /play — סולו (אתה מול המחשב)\n"
-        "👥 /trivia — קבוצתי (מי שעונה ראשון מנצח)\n\n"
-        "⚡ _שאלות נוצרות בזמן אמת ע\"י Claude AI_"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    text, keyboard = build_main_menu(name, is_group)
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def cmd_play(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """סולו — בחירת קטגוריה"""
     await update.message.reply_text(
         "🎮 *משחק סולו — בחר קטגוריה:*",
         parse_mode="Markdown",
-        reply_markup=build_category_keyboard(),
+        reply_markup=build_category_keyboard("cat"),
     )
 
 
 async def cmd_trivia(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """קבוצתי — בחירת קטגוריה"""
     chat_id = update.effective_chat.id
-    existing = get_group_game(ctx.bot_data, chat_id)
-    if existing:
+    if get_group_game(ctx.bot_data, chat_id):
         await update.message.reply_text("⏳ כבר יש שאלה פעילה! ענו עליה קודם.")
         return
-
     await update.message.reply_text(
         "👥 *משחק קבוצתי — בחר קטגוריה:*",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"{e} {n}", callback_data=f"gcat:{k}")]
-            for k, (e, n) in list(CATEGORIES.items())[:4]
-        ] + [
-            [InlineKeyboardButton(f"{e} {n}", callback_data=f"gcat:{k}")]
-            for k, (e, n) in list(CATEGORIES.items())[4:]
-        ]),
+        reply_markup=build_category_keyboard("gcat"),
     )
 
 
@@ -252,83 +241,168 @@ async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d    = get_user_score(ctx.bot_data, uid)
     s, t = d["score"], d["total"]
     pct  = int(s / t * 100) if t else 0
+    _, keyboard = build_main_menu(update.effective_user.first_name or "חבר")
     await update.message.reply_text(
-        f"{score_emoji(s)} *הניקוד שלך:*\n\n"
-        f"✅ נכון: {s}/{t}\n"
-        f"📊 הצלחה: {pct}%",
+        f"{score_emoji(s)} *הניקוד שלך:*\n\n✅ נכון: {s}/{t}\n📊 הצלחה: {pct}%",
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
 
 
 async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     scores = ctx.bot_data.get("scores", {})
     if not scores:
-        await update.message.reply_text("אין ניקודים עדיין — /play כדי להיות ראשון! 🏆")
+        await update.message.reply_text("אין ניקודים עדיין!")
         return
-
-    top = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)[:5]
+    top    = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)[:5]
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    lines = ["🏆 *טבלת מובילים:*\n"]
+    lines  = ["🏆 *טבלת מובילים:*\n"]
     for i, (uid, d) in enumerate(top):
-        lines.append(f"{medals[i]} {d.get('name','???')}: {d['score']} נקודות ({d['total']} שאלות)")
+        lines.append(f"{medals[i]} {d.get('name','???')}: {d['score']} ({d['total']} שאלות)")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 # ══════════════════════════════════════════════════════════
-#  Callback router
+#  שליחת שאלה חדשה (סולו) — פונקציה משותפת
 # ══════════════════════════════════════════════════════════
 
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def send_solo_question(query, ctx: ContextTypes.DEFAULT_TYPE, cat: str, diff: str):
+    real_cat = resolve_cat(cat)
+    asked    = ctx.user_data.get("asked_questions", [])
+
+    await query.edit_message_text(f"⏳ יוצר שאלה ב{cat_label(real_cat)}...")
+
+    try:
+        q = await generate_question(real_cat, diff, asked)
+    except Exception as e:
+        logger.error(f"generate_question error: {e}")
+        await query.edit_message_text(
+            "❌ שגיאה ביצירת שאלה.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 נסה שוב", callback_data=f"diff:{cat}:{diff}"),
+                InlineKeyboardButton("🏠 תפריט", callback_data="menu:home"),
+            ]])
+        )
+        return
+
+    # שמור שאלה + היסטוריה
+    asked.append(q["question"])
+    if len(asked) > 20:
+        asked = asked[-20:]
+    ctx.user_data["asked_questions"] = asked
+    ctx.user_data["solo_q"]    = q
+    ctx.user_data["solo_cat"]  = cat       # המקורי (יכול להיות mixed)
+    ctx.user_data["solo_diff"] = diff
+    ctx.user_data["solo_real_cat"] = real_cat
+
+    diff_label = DIFFICULTIES.get(diff, diff)
+    await query.edit_message_text(
+        f"🎮 *{cat_label(real_cat)} | {diff_label}*\n\n{q['question']}",
+        parse_mode="Markdown",
+        reply_markup=build_answer_keyboard(q["options"], cat, diff, "ans"),
+    )
+
+# ══════════════════════════════════════════════════════════
+#  Callback router ראשי
+# ══════════════════════════════════════════════════════════
+
+async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
     await query.answer()
-    data = query.data
+    data    = query.data
+    chat_id = update.effective_chat.id
+
+    # תשובה כשיש משחק קבוצתי פעיל
+    if data.startswith("ans:") and get_group_game(ctx.bot_data, chat_id):
+        await handle_group_answer(update, ctx)
+        return
+
+    # ── תפריט ראשי ──────────────────────────────────────
+    if data.startswith("menu:"):
+        action = data.split(":")[1]
+        name   = query.from_user.first_name or "חבר"
+        is_group = update.effective_chat.type in ("group", "supergroup")
+
+        if action == "home":
+            text, keyboard = build_main_menu(name, is_group)
+            await query.edit_message_text(text, reply_markup=keyboard)
+
+        elif action == "play":
+            await query.edit_message_text(
+                "🎮 *משחק סולו — בחר קטגוריה:*",
+                parse_mode="Markdown",
+                reply_markup=build_category_keyboard("cat"),
+            )
+
+        elif action == "trivia":
+            if get_group_game(ctx.bot_data, chat_id):
+                await query.edit_message_text("⏳ כבר יש שאלה פעילה! ענו עליה קודם.")
+                return
+            await query.edit_message_text(
+                "👥 *משחק קבוצתי — בחר קטגוריה:*",
+                parse_mode="Markdown",
+                reply_markup=build_category_keyboard("gcat"),
+            )
+
+        elif action == "score":
+            uid  = str(query.from_user.id)
+            d    = get_user_score(ctx.bot_data, uid)
+            s, t = d["score"], d["total"]
+            pct  = int(s / t * 100) if t else 0
+            text, keyboard = build_main_menu(name, is_group)
+            await query.edit_message_text(
+                f"{score_emoji(s)} *הניקוד שלך:*\n\n✅ נכון: {s}/{t}\n📊 הצלחה: {pct}%",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+
+        elif action == "top":
+            scores = ctx.bot_data.get("scores", {})
+            if not scores:
+                text, keyboard = build_main_menu(name, is_group)
+                await query.edit_message_text("אין ניקודים עדיין!", reply_markup=keyboard)
+                return
+            top    = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)[:5]
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+            lines  = ["🏆 *טבלת מובילים:*\n"]
+            for i, (uid, d) in enumerate(top):
+                lines.append(f"{medals[i]} {d.get('name','???')}: {d['score']} ({d['total']} שאלות)")
+            text, keyboard = build_main_menu(name, is_group)
+            await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
 
     # ── סולו: בחירת קטגוריה ────────────────────────────
-    if data.startswith("cat:"):
+    elif data.startswith("cat:"):
         cat = data.split(":")[1]
         ctx.user_data["solo_cat"] = cat
         await query.edit_message_text(
             f"🎮 *{cat_label(cat)}*\nבחר רמת קושי:",
             parse_mode="Markdown",
-            reply_markup=build_difficulty_keyboard(cat),
+            reply_markup=build_difficulty_keyboard(cat, "diff"),
         )
 
     # ── סולו: בחירת קושי → שאלה ────────────────────────
     elif data.startswith("diff:"):
-        _, cat, difficulty = data.split(":")
-        await query.edit_message_text(f"⏳ יוצר שאלה ב{cat_label(cat)}...")
-        try:
-            q = await generate_question(cat, difficulty)
-        except Exception as e:
-            logger.error(f"generate_question error: {e}")
-            await query.edit_message_text("❌ שגיאה. נסה שוב עם /play")
-            return
-
-        ctx.user_data["solo_q"]    = q
-        ctx.user_data["solo_cat"]  = cat
-        ctx.user_data["solo_diff"] = difficulty
-
-        await query.edit_message_text(
-            f"🎮 *{cat_label(cat)} | {DIFFICULTIES[difficulty]}*\n\n{q['question']}",
-            parse_mode="Markdown",
-            reply_markup=build_answer_keyboard(q["options"], cat),
-        )
+        parts = data.split(":")
+        cat, diff = parts[1], parts[2]
+        await send_solo_question(query, ctx, cat, diff)
 
     # ── סולו: תשובה ────────────────────────────────────
     elif data.startswith("ans:"):
-        _, cat, chosen_str = data.split(":")
-        chosen = int(chosen_str)
-        q      = ctx.user_data.get("solo_q")
-        diff   = ctx.user_data.get("solo_diff", "medium")
+        parts    = data.split(":")
+        cat, diff, chosen_str = parts[1], parts[2], parts[3]
+        chosen   = int(chosen_str)
+        q        = ctx.user_data.get("solo_q")
 
         if not q:
-            await query.edit_message_text("משחק פג. /play למשחק חדש.")
+            name = query.from_user.first_name or "חבר"
+            text, keyboard = build_main_menu(name)
+            await query.edit_message_text("המשחק פג. בחר מחדש:", reply_markup=keyboard)
             return
 
         correct      = q["correct"]
         correct_text = q["options"][correct]
-        uid  = str(query.from_user.id)
-        name = query.from_user.first_name or "שחקן"
-        is_correct = (chosen == correct)
+        uid          = str(query.from_user.id)
+        name         = query.from_user.first_name or "שחקן"
+        is_correct   = (chosen == correct)
 
         update_score(ctx.bot_data, uid, name, is_correct)
         d = get_user_score(ctx.bot_data, uid)
@@ -336,14 +410,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         result = "✅ *נכון!*" if is_correct else "❌ *לא נכון*"
 
+        # ← ממשיך אוטומטית לשאלה הבאה
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 שאלה נוספת באותה קטגוריה", callback_data=f"diff:{cat}:{diff}")],
-            [InlineKeyboardButton("🗂 קטגוריה אחרת", callback_data="back_to_cats")],
+            [InlineKeyboardButton("▶️ שאלה הבאה", callback_data=f"diff:{cat}:{diff}")],
+            [InlineKeyboardButton("🗂 קטגוריה אחרת", callback_data="menu:play"),
+             InlineKeyboardButton("🏠 תפריט", callback_data="menu:home")],
         ])
 
         await query.edit_message_text(
             f"{result}\n\n"
-            f"🎵 תשובה: *{correct_text}*\n"
+            f"✅ תשובה: *{correct_text}*\n"
             f"💡 {q.get('explanation','')}\n\n"
             f"📊 ניקוד: {d['score']}/{d['total']}",
             parse_mode="Markdown",
@@ -351,62 +427,54 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     # ── חזרה לקטגוריות ──────────────────────────────────
-    elif data == "back_to_cats":
+    elif data.startswith("back_cats:"):
+        prefix = data.split(":")[1]
+        cat_prefix = "cat" if prefix == "diff" else "gcat"
         await query.edit_message_text(
             "🎮 *בחר קטגוריה:*",
             parse_mode="Markdown",
-            reply_markup=build_category_keyboard(),
+            reply_markup=build_category_keyboard(cat_prefix),
         )
 
     # ── קבוצתי: בחירת קטגוריה ──────────────────────────
     elif data.startswith("gcat:"):
         cat = data.split(":")[1]
-        ctx.chat_data["group_cat"] = cat
         await query.edit_message_text(
             f"👥 *{cat_label(cat)}*\nבחר רמת קושי:",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(label, callback_data=f"gdiff:{cat}:{key}")]
-                for key, label in DIFFICULTIES.items()
-            ]),
+            reply_markup=build_difficulty_keyboard(cat, "gdiff"),
         )
 
     # ── קבוצתי: בחירת קושי → שאלה ─────────────────────
     elif data.startswith("gdiff:"):
-        _, cat, difficulty = data.split(":")
+        parts = data.split(":")
+        cat, difficulty = parts[1], parts[2]
         chat_id = update.effective_chat.id
 
         if get_group_game(ctx.bot_data, chat_id):
-            return  # כבר יש משחק
+            return
 
-        await query.edit_message_text(f"⏳ יוצר שאלה קבוצתית ב{cat_label(cat)}...")
+        real_cat = resolve_cat(cat)
+        await query.edit_message_text(f"⏳ יוצר שאלה קבוצתית ב{cat_label(real_cat)}...")
 
         try:
-            q = await generate_question(cat, difficulty)
+            q = await generate_question(real_cat, difficulty)
         except Exception as e:
             logger.error(f"group generate_question error: {e}")
             await query.edit_message_text("❌ שגיאה. נסה שוב עם /trivia")
             return
 
-        # שמור משחק קבוצתי
-        game = {
-            "q":          q,
-            "cat":        cat,
-            "difficulty": difficulty,
-            "answered":   False,
-        }
+        game = {"q": q, "cat": cat, "real_cat": real_cat, "difficulty": difficulty, "answered": False}
         set_group_game(ctx.bot_data, chat_id, game)
 
-        keyboard = build_answer_keyboard(q["options"], cat)
-        msg = await query.edit_message_text(
-            f"👥 *{cat_label(cat)} | {DIFFICULTIES[difficulty]}*\n"
+        await query.edit_message_text(
+            f"👥 *{cat_label(real_cat)} | {DIFFICULTIES[difficulty]}*\n"
             f"⏱ {GROUP_TIMEOUT} שניות לענות!\n\n"
             f"{q['question']}",
             parse_mode="Markdown",
-            reply_markup=keyboard,
+            reply_markup=build_answer_keyboard(q["options"], cat, difficulty, "ans"),
         )
 
-        # טיימר — אם לא ענו, חשוף תשובה
         async def timeout_reveal():
             await asyncio.sleep(GROUP_TIMEOUT)
             current = get_group_game(ctx.bot_data, chat_id)
@@ -416,10 +484,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 try:
                     await ctx.bot.send_message(
                         chat_id,
-                        f"⏰ *הזמן עבר!* אף אחד לא ענה נכון.\n\n"
-                        f"✅ התשובה: *{correct_text}*\n"
-                        f"💡 {q.get('explanation','')}\n\n"
-                        f"כתבו /trivia לשאלה הבאה!",
+                        f"⏰ *הזמן עבר!*\n\n✅ התשובה: *{correct_text}*\n💡 {q.get('explanation','')}\n\nכתבו /trivia לשאלה הבאה!",
                         parse_mode="Markdown",
                     )
                 except Exception:
@@ -427,49 +492,38 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         asyncio.create_task(timeout_reveal())
 
-    # ── קבוצתי: תשובה ───────────────────────────────────
-    elif data.startswith("gans:"):
-        # מטפל בתשובות קבוצתיות — כפתורים אלו נוצרים ע"י build_answer_keyboard עם prefix "ans:"
-        # (ראה למטה — גם "ans:" מנותב לכאן אם יש משחק קבוצתי פעיל)
-        pass
-
 # ══════════════════════════════════════════════════════════
-#  תשובות קבוצתיות — כפתורי "ans:" בהקשר קבוצה
+#  תשובות קבוצתיות
 # ══════════════════════════════════════════════════════════
 
-async def on_group_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    אם ה-callback "ans:..." מגיע מקבוצה שיש בה משחק פעיל —
-    מטפל פה במקום ב-on_callback.
-    """
+async def handle_group_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
-    await query.answer()
     data    = query.data
     chat_id = update.effective_chat.id
 
     game = get_group_game(ctx.bot_data, chat_id)
     if not game or game.get("answered"):
-        return  # אין משחק פעיל / כבר נענה
+        return
 
-    _, cat, chosen_str = data.split(":")
-    chosen    = int(chosen_str)
-    q         = game["q"]
-    correct   = q["correct"]
+    parts      = data.split(":")
+    cat, diff, chosen_str = parts[1], parts[2], parts[3]
+    chosen     = int(chosen_str)
+    q          = game["q"]
+    correct    = q["correct"]
     is_correct = (chosen == correct)
 
-    # סמן כנענה (גם אם שגוי — מונע כפילויות)
     game["answered"] = True
     set_group_game(ctx.bot_data, chat_id, None)
 
-    uid  = str(query.from_user.id)
-    name = query.from_user.first_name or "שחקן"
+    uid          = str(query.from_user.id)
+    name         = query.from_user.first_name or "שחקן"
     correct_text = q["options"][correct]
 
     update_score(ctx.bot_data, uid, name, is_correct)
     d = get_user_score(ctx.bot_data, uid)
 
     if is_correct:
-        result_text = (
+        text = (
             f"🏆 *{name} ענה נכון ראשון!*\n\n"
             f"✅ תשובה: *{correct_text}*\n"
             f"💡 {q.get('explanation','')}\n\n"
@@ -477,29 +531,14 @@ async def on_group_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"כתבו /trivia לשאלה הבאה!"
         )
     else:
-        result_text = (
+        text = (
             f"❌ *{name} ענה לא נכון.*\n\n"
             f"✅ התשובה הנכונה: *{correct_text}*\n"
             f"💡 {q.get('explanation','')}\n\n"
             f"כתבו /trivia לשאלה הבאה!"
         )
 
-    await query.edit_message_text(result_text, parse_mode="Markdown")
-
-# ══════════════════════════════════════════════════════════
-#  Router — מחליט אם callback הוא סולו או קבוצתי
-# ══════════════════════════════════════════════════════════
-
-async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    data    = query.data
-    chat_id = update.effective_chat.id
-
-    # אם יש משחק קבוצתי פעיל ומגיע תשובה → קבוצתי
-    if data.startswith("ans:") and get_group_game(ctx.bot_data, chat_id):
-        await on_group_answer(update, ctx)
-    else:
-        await on_callback(update, ctx)
+    await query.edit_message_text(text, parse_mode="Markdown")
 
 # ══════════════════════════════════════════════════════════
 #  הפעלה
@@ -509,14 +548,13 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("play",   cmd_play))
     app.add_handler(CommandHandler("trivia", cmd_trivia))
     app.add_handler(CommandHandler("score",  cmd_score))
     app.add_handler(CommandHandler("top",    cmd_top))
     app.add_handler(CallbackQueryHandler(callback_router))
 
-    logger.info("🎯 בוט טריוויה v2 מתחיל...")
+    logger.info("🎯 בוט טריוויה v3 מתחיל...")
     app.run_polling()
 
 
